@@ -1,43 +1,63 @@
-﻿using MadWizard.WinUSBNet;
+﻿using LibUsbDotNet;
+using LibUsbDotNet.Main;
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading;
 
 namespace com.clusterrr.FelLib
 {
-    public class Fel
+    public class Fel : IDisposable
     {
         public byte[] Fes1Bin;
-        public byte[] UBootBin;
+        byte[] uBootBin;
 
         public enum CurrentAction { RunningCommand, ReadingMemory, WritingMemory }
         public delegate void OnFelProgress(CurrentAction action, string command);
 
-        USBDevice device = null;
-        byte inEndp = 0;
-        byte outEndp = 0;
+        UsbDevice device = null;
+        UsbEndpointReader epReader = null;
+        UsbEndpointWriter epWriter = null;
         const int ReadTimeout = 1000;
         const int WriteTimeout = 1000;
         public const int MaxBulkSize = 0x10000;
         UInt16 vid, pid;
         bool DramInitDone = false;
 
-        const UInt32 cmdOffset = 0x604FF;
-        const UInt32 fes1_base_m = 0x2000;
-        const UInt32 dram_base = 0x40000000;
-        const UInt32 flash_mem_base = 0x43800000;
-        const UInt32 flash_mem_size = 0x20;
-        const UInt32 uboot_base_m = 0x47000000u;
-        const UInt32 sector_size = 0x20000;
-        const UInt32 uboot_base_f = 0x100000;
-        const UInt32 kernel_base_f = (sector_size * 0x30);
-        const UInt32 kernel_base_m = flash_mem_base;
-        const UInt32 kernel_max_size = (uboot_base_m - flash_mem_base);
-        const UInt32 kernel_max_flash_size = (sector_size * 0x20);
-        const string fastboot = "fastboot_test";
+        int cmdOffset = -1;
+        public const UInt32 fes1_base_m = 0x2000;
+        public const UInt32 dram_base = 0x40000000;
+        public const UInt32 uboot_base_m = dram_base + 0x7000000u;
+        public const UInt32 uboot_base_f = 0x100000u;
+        public const UInt32 sector_size = 0x20000u;
+        public const UInt32 uboot_maxsize_f = (sector_size * 0x10);
+        public const UInt32 kernel_base_f = sector_size * 0x30;
+        public const UInt32 kernel_max_size = sector_size * 0x20;
+        public const UInt32 transfer_base_m = dram_base + 0x7400000u;
+        public const UInt32 transfer_max_size = sector_size * 0x100;
+        const string fastboot = "efex_test";
+
+        public byte[] UBootBin
+        {
+            get
+            {
+                return uBootBin;
+            }
+
+            set
+            {
+                uBootBin = value;
+                var prefix = "bootcmd=";
+                for (int i = 0; i < uBootBin.Length - prefix.Length; i++)
+                    if (Encoding.ASCII.GetString(uBootBin, i, prefix.Length) == prefix)
+                    {
+                        cmdOffset = i + prefix.Length;
+                        break;
+                    }
+            }
+        }
 
         public static bool DeviceExists(UInt16 vid, UInt16 pid)
         {
@@ -45,16 +65,12 @@ namespace com.clusterrr.FelLib
             try
             {
                 fel.Open(vid, pid);
-#if DEBUG
-                DebugLog("Device detection successful");
-#endif
+                Debug.WriteLine("Device detection successful");
                 return true;
             }
             catch (Exception ex)
             {
-#if DEBUG
-                DebugLog("Device detection error: " + ex.Message + ex.StackTrace);
-#endif
+                Debug.WriteLine("Device detection error: " + ex.Message + ex.StackTrace);
                 return false;
             }
             finally
@@ -68,75 +84,106 @@ namespace com.clusterrr.FelLib
             this.vid = vid;
             this.pid = pid;
             Close();
-#if DEBUG
-            DebugLog("Trying to open device...");
-#endif
-            device = USBDevice.GetSingleDevice(vid, pid);
-            if (device == null) throw new FelException("Device with such VID and PID not found");
-#if DEBUG
-            DebugLog("Checking USB endpoints...");
-#endif
-            foreach (var pipe in device.Pipes)
+            Debug.WriteLine("Trying to open device...");
+            var devices = UsbDevice.AllDevices;
+            device = null;
+            foreach (UsbRegistry regDevice in devices)
             {
-                if (pipe.IsIn)
+                if (regDevice.Vid == vid && regDevice.Pid == pid)
                 {
-                    inEndp = pipe.Address;
-#if DEBUG
-                    DebugLog("IN endpoint found: "+ inEndp);
-#endif
-                }
-                else
-                {
-                    outEndp = pipe.Address;
-#if DEBUG
-                    DebugLog("Out endpoint found: "+outEndp);
-#endif
+                    regDevice.Open(out device);
+                    break;
                 }
             }
-            device.Pipes[inEndp].Policy.PipeTransferTimeout = ReadTimeout;
-            device.Pipes[outEndp].Policy.PipeTransferTimeout = WriteTimeout;
-#if DEBUG
-            DebugLog("Trying to verify device");
-#endif
+            if (device == null) throw new FelException("Device with such VID and PID not found");
+
+            IUsbDevice wholeUsbDevice = device as IUsbDevice;
+            if (!ReferenceEquals(wholeUsbDevice, null))
+            {
+                // This is a "whole" USB device. Before it can be used, 
+                // the desired configuration and interface must be selected.
+
+                // Select config #1
+                wholeUsbDevice.SetConfiguration(1);
+
+                // Claim interface #0.
+                wholeUsbDevice.ClaimInterface(0);
+            }
+
+            int inEndp = -1;
+            int outEndp = -1;
+            int inMax = 0;
+            int outMax = 0;
+            Debug.WriteLine("Checking USB endpoints...");
+            foreach (var config in device.Configs)
+                foreach (var @interface in config.InterfaceInfoList)
+                    foreach (var endp in @interface.EndpointInfoList)
+                    {
+                        if ((endp.Descriptor.EndpointID & 0x80) != 0)
+                        {
+                            inEndp = endp.Descriptor.EndpointID;
+                            inMax = endp.Descriptor.MaxPacketSize;
+                            Debug.WriteLine("IN endpoint found: " + inEndp);
+                            Debug.WriteLine("IN endpoint maxsize: " + inMax);
+                        }
+                        else
+                        {
+                            outEndp = endp.Descriptor.EndpointID;
+                            outMax = endp.Descriptor.MaxPacketSize;
+                            Debug.WriteLine("OUT endpoint found: " + outEndp);
+                            Debug.WriteLine("OUT endpoint maxsize: " + outMax);
+                        }
+                    }
+            if (inEndp != 0x82 || outEndp != 0x01)
+                throw new Exception("Uncorrect FEL device");
+            epReader = device.OpenEndpointReader((ReadEndpointID)inEndp, 65536);
+            epWriter = device.OpenEndpointWriter((WriteEndpointID)outEndp);
+
+            Debug.WriteLine("Trying to verify device");
             if (VerifyDevice().Board != 0x00166700) throw new FelException("Invalid board ID: " + VerifyDevice().Board);
         }
         public void Close()
         {
             if (device != null)
-            {
-                try
-                {
-                    device.Pipes[inEndp].Abort();
-                }
-                catch { }
-                try
-                {
-                    device.Pipes[outEndp].Abort();
-                }
-                catch
-                {
-                }
-                device.Dispose();
-                device = null;
-            }
+                device.Close();
+            device = null;
+            if (epReader != null)
+                epReader.Dispose();
+            epReader = null;
+            if (epWriter != null)
+                epWriter.Dispose();
+            epWriter = null;
         }
 
         private void WriteToUSB(byte[] buffer)
         {
-#if DEBUG
-            DebugLog("-> " + BitConverter.ToString(buffer));
+#if VERY_DEBUG
+            Debug.WriteLine("->[FEL] " + BitConverter.ToString(buffer));
 #endif
-
-            device.Pipes[outEndp].Write(buffer);
+            Debug.WriteLine(string.Format("-> {0} bytes", buffer.Length));
+            int pos = 0;
+            int l;
+            while (pos < buffer.Length)
+            {
+                epWriter.Write(buffer, pos, buffer.Length - pos, WriteTimeout, out l);
+                if (l > 0)
+                    pos += l;
+                else
+                    throw new Exception("Can't write to USB");
+            }
         }
 
         private int ReadFromUSB(byte[] buffer, int offset, int length)
         {
-            var data = device.Pipes[inEndp].Read(buffer, offset, length);
-#if DEBUG
-            DebugLog("<- " + BitConverter.ToString(buffer));
+            int l;
+            var result = epReader.Read(buffer, offset, length, ReadTimeout, out l);
+            if (result != ErrorCode.Ok)
+                throw new Exception("USB read error: " + result.ToString());
+#if VERY_DEBUG
+            Debug.WriteLine("<-[FEL] " + BitConverter.ToString(buffer));
 #endif
-            return data;
+            Debug.WriteLine(string.Format("<- {0} bytes", length));
+            return l;
         }
         private byte[] ReadFromUSB(UInt32 length)
         {
@@ -222,7 +269,7 @@ namespace com.clusterrr.FelLib
             int pos = 0;
             while (pos < buffer.Length)
             {
-                if (callback != null) callback(CurrentAction.WritingMemory, null);
+                callback?.Invoke(CurrentAction.WritingMemory, null);
                 var buf = new byte[Math.Min(buffer.Length - pos, MaxBulkSize)];
                 Array.Copy(buffer, pos, buf, 0, buf.Length);
                 FelRequest(AWFELStandardRequest.RequestType.FEL_DOWNLOAD, (UInt32)(address + pos), (uint)buf.Length);
@@ -243,7 +290,7 @@ namespace com.clusterrr.FelLib
             var result = new List<byte>();
             while (length > 0)
             {
-                if (callback != null) callback(CurrentAction.ReadingMemory, null);
+                callback?.Invoke(CurrentAction.ReadingMemory, null);
                 var l = Math.Min(length, MaxBulkSize);
                 FelRequest(AWFELStandardRequest.RequestType.FEL_UPLOAD, address, l);
                 var r = FelRead((UInt32)l);
@@ -279,45 +326,44 @@ namespace com.clusterrr.FelLib
         public byte[] ReadFlash(UInt32 address, UInt32 length, OnFelProgress callback = null)
         {
             var result = new List<byte>();
-            while (((length + address % sector_size + sector_size - 1) / sector_size) > flash_mem_size)
+            string command;
+            if ((address % sector_size) != 0)
+                throw new FelException(string.Format("Invalid flash address : 0x{0:X8}", address));
+            if ((length % sector_size) != 0)
+                throw new FelException(string.Format("Invalid flash length: 0x{0:X8}", length));
+            while (length > 0)
             {
-                var sectors = (length + address % sector_size + sector_size - 1) / sector_size - flash_mem_size;
-                var buf = ReadFlash(address, sectors * sector_size - address % sector_size, callback);
+                var reqLen = Math.Min(length, transfer_max_size);
+                command = string.Format("sunxi_flash phy_read {0:x} {1:x} {2:x};{3}", transfer_base_m, address / sector_size, (int)Math.Floor((double)reqLen / (double)sector_size), fastboot);
+                RunUbootCmd(command, false, callback);
+                var buf = ReadMemory(transfer_base_m + address % sector_size, reqLen, callback);
+                result.AddRange(buf);
                 address += (uint)buf.Length;
                 length -= (uint)buf.Length;
-                result.AddRange(buf);
             }
-            if (result.Count > 0) return result.ToArray();
-            var command = string.Format("sunxi_flash phy_read {0:x} {1:x} {2:x};{3}", flash_mem_base, address / sector_size, (length + address % sector_size + sector_size - 1) / sector_size, fastboot);
-            RunUbootCmd(command, false, callback);
-            result.AddRange(ReadMemory(flash_mem_base + address % sector_size, length, callback));
             return result.ToArray();
         }
 
         public void WriteFlash(UInt32 address, byte[] buffer, OnFelProgress callback = null)
         {
-            int length = buffer.Length;
-            int pos = 0;
+            var length = (uint)buffer.Length;
+            uint pos = 0;
             if ((address % sector_size) != 0)
-                throw new FelException(string.Format("Invalid address to flash: 0x{0:X8}", address));
+                throw new FelException(string.Format("Invalid flash address : 0x{0:X8}", address));
             if ((length % sector_size) != 0)
-                throw new FelException(string.Format("Invalid length to flash: 0x{0:X8}", length));
-            byte[] newBuf;
-            while ((length / sector_size) > flash_mem_size)
+                throw new FelException(string.Format("Invalid flash length: 0x{0:X8}", length));
+            while (length > 0)
             {
-                var sectors = (length / sector_size) - flash_mem_size;
-                newBuf = new byte[sectors * sector_size];
-                Array.Copy(buffer, pos, newBuf, 0, newBuf.Length);
-                WriteFlash(address, newBuf, callback);
-                address += (UInt32)newBuf.Length;
-                length -= newBuf.Length;
-                pos += newBuf.Length;
+                var wrLength = Math.Min(length, transfer_max_size / 8);
+                var newBuf = new byte[wrLength];
+                Array.Copy(buffer, pos, newBuf, 0, wrLength);
+                WriteMemory(transfer_base_m, newBuf, callback);
+                var command = string.Format("sunxi_flash phy_write {0:x} {1:x} {2:x};{3}", transfer_base_m, address / sector_size, (int)Math.Floor((double)wrLength / (double)sector_size), fastboot);
+                RunUbootCmd(command, false, callback);
+                pos += (uint)wrLength;
+                address += (uint)wrLength;
+                length -= (uint)wrLength;
             }
-            newBuf = new byte[length - pos];
-            Array.Copy(buffer, pos, newBuf, 0, newBuf.Length);
-            WriteMemory(flash_mem_base, newBuf, callback);
-            var command = string.Format("sunxi_flash phy_write {0:x} {1:x} {2:x};{3}", flash_mem_base, address / sector_size, length / sector_size, fastboot);
-            RunUbootCmd(command, false, callback);
         }
 
         public void Exec(UInt32 address)
@@ -329,7 +375,8 @@ namespace com.clusterrr.FelLib
 
         public void RunUbootCmd(string command, bool noreturn = false, OnFelProgress callback = null)
         {
-            if (callback != null) callback(CurrentAction.RunningCommand, command);
+            callback?.Invoke(CurrentAction.RunningCommand, command);
+            if (cmdOffset < 0) throw new Exception("Invalid Unoot binary, command variable not found");
             const UInt32 testSize = 0x20;
             if (UBootBin == null || UBootBin.Length < testSize)
                 throw new FelException("Can't init Uboot, incorrect Uboot binary");
@@ -345,8 +392,8 @@ namespace com.clusterrr.FelLib
             Close();
             for (int i = 0; i < 10; i++)
             {
-                Thread.Sleep(1000);
-                if (callback != null) callback(CurrentAction.RunningCommand, command);
+                Thread.Sleep(500);
+                callback?.Invoke(CurrentAction.RunningCommand, command);
             }
             int errorCount = 0;
             while (true)
@@ -369,16 +416,9 @@ namespace com.clusterrr.FelLib
             }
         }
 
-#if DEBUG
-        private static void DebugLog(string text)
+        public void Dispose()
         {
-            Console.WriteLine(text);
-            try
-            {
-                File.AppendAllText("debug.txt", DateTime.Now + ": " + text + "\r\n");
-            }
-            catch { }
+            Close();
         }
-#endif
     }
 }

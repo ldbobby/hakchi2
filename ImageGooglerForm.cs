@@ -1,13 +1,10 @@
 ﻿using com.clusterrr.hakchi_gui.Properties;
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
-using System.Linq;
 using System.Net;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web;
@@ -24,40 +21,51 @@ namespace com.clusterrr.hakchi_gui
             get { return result; }
         }
 
-        public ImageGooglerForm(string query)
+        public ImageGooglerForm(NesMiniApplication app)
         {
             InitializeComponent();
-            Text = "Google Images - " + query;
+            if (!string.IsNullOrEmpty(app.Name))
+                Text += " - " + app.Name;
             searchThread = new Thread(SearchThread);
-            searchThread.Start(query);
+            searchThread.Start(app);
         }
 
-        string[] GetImageUrls(string query)
+        public static string[] GetImageUrls(NesMiniApplication app)
         {
+            string query = app.Name ?? "";
+            query += " " + app.GoogleSuffix + " (box|cover) art";
             var url = string.Format("https://www.google.com/search?q={0}&source=lnms&tbm=isch", HttpUtility.UrlEncode(query));
+            Debug.WriteLine("Web request: " + url);
             var request = WebRequest.Create(url);
             request.Credentials = CredentialCache.DefaultCredentials;
             (request as HttpWebRequest).UserAgent = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36";
             request.Timeout = 10000;
-            var response = (HttpWebResponse)request.GetResponse();
+            var response = request.GetResponse();
             Stream dataStream = response.GetResponseStream();
-            var pageData = new StringBuilder();
-            int b;
-            var result = new List<byte>();
-            while ((b = dataStream.ReadByte()) >= 0)
-                result.Add((byte)b);
-            dataStream.Close();
+            StreamReader reader = new StreamReader(dataStream);
+            string responseFromServer = reader.ReadToEnd();
+            reader.Close();
             response.Close();
-            var page = Encoding.UTF8.GetString(result.ToArray());
+            //Debug.WriteLine("Web response: " + responseFromServer);
 
-            var r = new Regex(@"\""ou\""\:\""(?<url>.+?)\""");
-            var mc = r.Matches(page);
             var urls = new List<string>();
-            for (int i = 0; i < mc.Count && i < 20; i++)
+            string search = @"\""ou\""\:\""(?<url>.+?)\""";
+            MatchCollection matches = Regex.Matches(responseFromServer, search);
+            foreach (Match match in matches)
             {
-                var gr = mc[i].Groups;
-                urls.Add(gr["url"].Value);
+                urls.Add(HttpUtility.UrlDecode(match.Groups[1].Value.Replace("\\u00", "%")));
             }
+
+            // For some reason Google returns different data for dirrefent users (IPs?)
+            // There is alternative method
+            search = @"imgurl=(.*?)&";
+            matches = Regex.Matches(responseFromServer, search);
+            foreach (Match match in matches)
+            {
+                // Not sure about it.
+                urls.Add(HttpUtility.UrlDecode(match.Groups[1].Value.Replace("\\u00", "%")));
+            }
+
             return urls.ToArray();
         }
 
@@ -65,12 +73,13 @@ namespace com.clusterrr.hakchi_gui
         {
             try
             {
-                var urls = GetImageUrls(o as string);
+                var urls = GetImageUrls(o as NesMiniApplication);
                 foreach (var url in urls)
                 {
                     //new Thread(DownloadImageThread).Start(url);
                     try
                     {
+                        Debug.WriteLine("Downloading image: " + url);
                         var image = DownloadImage(url);
                         ShowImage(image);
                     }
@@ -83,6 +92,7 @@ namespace com.clusterrr.hakchi_gui
             }
             catch (Exception ex)
             {
+                Debug.WriteLine(ex.Message + ex.StackTrace);
                 MessageBox.Show(ex.Message, Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -132,8 +142,7 @@ namespace com.clusterrr.hakchi_gui
             catch { }
         }
 
-
-        Image DownloadImage(string url)
+        public static Image DownloadImage(string url)
         {
             var request = HttpWebRequest.Create(url);
             request.Credentials = CredentialCache.DefaultCredentials;
@@ -161,6 +170,5 @@ namespace com.clusterrr.hakchi_gui
         {
             if (searchThread != null) searchThread.Abort();
         }
-
     }
 }
