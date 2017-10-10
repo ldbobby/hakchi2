@@ -12,11 +12,11 @@ using System.Xml.XPath;
 
 namespace com.clusterrr.hakchi_gui
 {
-    public class SnesGame : NesMiniApplication, ICloverAutofill
+    public class SnesGame : NesMiniApplication, ICloverAutofill /*, ISupportsGameGenie*/
     {
         public enum SnesRomType { LoRom = 0x14, HiRom = 0x15 };
 
-        const string DefaultArgs = "--volume 100 -rollback-snapshot-period 600";
+        const string DefaultCanoeArgs = "--volume 100 -rollback-snapshot-period 600";
         static List<byte> SfxTypes = new List<byte>() { 0x13, 0x14, 0x15, 0x1a };
         static List<byte> Dsp1Types = new List<byte>() { 0x03, 0x05 };
         static List<byte> SA1Types = new List<byte>() { 0x34, 0x35 };
@@ -58,7 +58,7 @@ namespace com.clusterrr.hakchi_gui
             { "YOSSY'S ISLAND", 0x1243 },
             { "FINAL FIGHT", 0x100E },
             { "DIDDY'S KONG QUEST", 0x105D },
-            { "KIRBY'S DREAM LAND 3", 0x10A2 },
+            //{ "KIRBY'S DREAM LAND 3", 0x10A2 }, // Reported as problematic, using ID from Mario RPG
             { "BREATH OF FIRE 2", 0x1068 },
             { "FINAL FIGHT 2", 0x10E1 },
             { "MEGAMAN X2", 0x1117 },
@@ -174,7 +174,7 @@ namespace com.clusterrr.hakchi_gui
             if (ConfigIni.ConsoleType == MainForm.ConsoleType.SNES || ConfigIni.ConsoleType == MainForm.ConsoleType.SuperFamicom)
             {
                 application = "/bin/clover-canoe-shvc-wr -rom";
-                args = DefaultArgs;
+                args = DefaultCanoeArgs;
                 if (ext.ToLower() != ".sfrom") // Need to patch for canoe
                 {
                     Debug.WriteLine($"Trying to convert {inputFileName}");
@@ -213,7 +213,7 @@ namespace com.clusterrr.hakchi_gui
             return true;
         }
 
-        private static SnesRomHeader GetCorrectHeader(byte[] rawRomData, out SnesRomType romType, out string gameTitle)
+        public static SnesRomHeader GetCorrectHeader(byte[] rawRomData, out SnesRomType romType, out string gameTitle)
         {
             var romHeaderLoRom = SnesRomHeader.Read(rawRomData, 0x7FC0);
             var romHeaderHiRom = SnesRomHeader.Read(rawRomData, 0xFFC0);
@@ -382,7 +382,7 @@ namespace com.clusterrr.hakchi_gui
 
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct SnesRomHeader
+        public struct SnesRomHeader
         {
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 21)]
             public byte[] GameTitleArr;
@@ -711,6 +711,43 @@ namespace com.clusterrr.hakchi_gui
                 return true;
             }
             return false;
+        }
+
+        public void ApplyGameGenie()
+        {
+            if (!string.IsNullOrEmpty(GameGenie))
+            {
+                var codes = GameGenie.Split(new char[] { ',', '\t', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries);
+                var nesFiles = Directory.GetFiles(this.GamePath, "*.*", SearchOption.TopDirectoryOnly);
+                foreach (var f in nesFiles)
+                {
+                    byte[] data;
+                    var ext = Path.GetExtension(f).ToLower();
+                    int offset;
+                    if (ext == ".sfrom")
+                    {
+                        data = File.ReadAllBytes(f);
+                        offset = 48;
+                    }  else if (ext == ".sfc" || ext == ".smc")
+                    {
+                        data = File.ReadAllBytes(f);
+                        if ((data.Length % 1024) != 0)
+                            offset = 512;
+                        else
+                            offset = 0;
+                    }
+                    else continue;
+
+                    var rawData = new byte[data.Length - offset];
+                    Array.Copy(data, offset, rawData, 0, rawData.Length);
+
+                    foreach (var code in codes)
+                        rawData = GameGeniePatcherSnes.Patch(rawData, code);
+
+                    Array.Copy(rawData, 0, data, offset, rawData.Length);
+                    File.WriteAllBytes(f, data);                        
+                }
+            }
         }
     }
 }
